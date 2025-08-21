@@ -116,6 +116,28 @@ function Get-AppServiceEnvironmentDetails {
     }
 }
 
+function Get-RecommendedSkuUpgrade {
+    param([string]$CurrentSku)
+    
+    # Convert SKU to uppercase for consistent comparison
+    $CurrentSku = $CurrentSku.ToUpper()
+    
+    # Map current SKU to recommended upgrade based on tier and size
+    switch -Regex ($CurrentSku) {
+        # Lowest tier plans (F1, B1, S1, D1, etc.) -> P0v3
+        '^(F1|B1|S1|D1)$' { return "P0v3" }
+        
+        # Second tier plans (B2, S2, etc.) -> P1v3
+        '^(B2|S2)$' { return "P1v3" }
+        
+        # Third tier plans (B3, S3, etc.) -> P2v3
+        '^(B3|S3)$' { return "P2v3" }
+        
+        # For any other plans, default to P1v3
+        default { return "P1v3" }
+    }
+}
+
 function Parse-ResourceId {
     param([string]$ResourceId)
     
@@ -288,10 +310,27 @@ foreach ($resourceId in $resourceIds) {
         if ($zoneRedundant -eq $true) {
             $eligibleText = "Already ZR"
         }
+        elseif (-not $regionSupportsZones) {
+            # Check region support first - fundamental limitation
+            $eligibleText = "Region Not Supported"
+        }
+        elseif ($maximumNumberOfZones -eq 1) {
+            # Check zone limitation next - fundamental limitation that SKU upgrade can't fix
+            $eligibleText = "Requires New Plan"
+        }
+        elseif ($isIsolatedV2 -and $aseZoneRedundant -eq $false) {
+            # Check ASE limitation for Isolated v2 plans
+            $eligibleText = "ASE Not ZR"
+        }
         elseif ($regionSupportsZones -and $skuSupportsZones -and $maximumNumberOfZones -gt 1 -and 
                 (-not $isIsolatedV2 -or $aseZoneRedundant -eq $true)) {
+            # Plan is ready for direct conversion
             $isEligible = $true
             $eligibleText = "Yes"
+        }
+        elseif ($regionSupportsZones -and $maximumNumberOfZones -gt 1 -and (-not $skuSupportsZones)) {
+            # Plan is in a supported region, supports multiple zones, but has unsupported SKU - can be upgraded
+            $eligibleText = "Requires SKU Upgrade"
         }
         
         # Display result
@@ -337,10 +376,19 @@ Write-Host "Note: Zone redundancy requires Premium v2, Premium v3, Premium v4, o
 Write-Host ""
 Write-Host "=== Zone Redundancy Conversion ===" -ForegroundColor Blue
 $eligibleForConversion = $nonZoneRedundantPlans
-if ($eligibleForConversion -gt 0) {
-    Write-Host "Found $eligibleForConversion plan(s) that can be converted to zone redundant." -ForegroundColor Yellow
+$eligibleForUpgrade = $skuNotSupported
+
+if ($eligibleForConversion -gt 0 -or $eligibleForUpgrade -gt 0) {
+    if ($eligibleForConversion -gt 0) {
+        Write-Host "Found $eligibleForConversion plan(s) that can be converted to zone redundant." -ForegroundColor Yellow
+    }
+    if ($eligibleForUpgrade -gt 0) {
+        Write-Host "Found $eligibleForUpgrade plan(s) with unsupported SKUs that can be upgraded and converted." -ForegroundColor Yellow
+    }
+    
     Write-Host "This will:"
     Write-Host "• Enable zone redundancy on eligible plans"
+    Write-Host "• Upgrade SKUs for plans with unsupported tiers (with confirmation)"
     Write-Host "• Set minimum instance count to 2 (if currently less than 2)"
     Write-Host "• Keep current instance count if already 2 or more"
     Write-Host ""
@@ -348,9 +396,12 @@ if ($eligibleForConversion -gt 0) {
     
     if ($proceed -eq 'y' -or $proceed -eq 'Y' -or $proceed -eq 'yes' -or $proceed -eq 'YES') {
         Write-Host ""
-        Write-Host "=== Converting Plans to Zone Redundant ===" -ForegroundColor Blue
+        Write-Host "=== Planning Conversions ===" -ForegroundColor Blue
         
-        # Re-process resource IDs for conversion
+        # Collection to store conversion plans
+        $conversionPlans = @()
+        
+        # First pass: Collect all conversion decisions
         foreach ($resourceId in $resourceIds) {
             $parsed = Parse-ResourceId -ResourceId $resourceId
             
@@ -358,7 +409,7 @@ if ($eligibleForConversion -gt 0) {
                 continue
             }
             
-            # Get plan details again
+            # Get plan details
             try {
                 $planDetailsJson = az appservice plan show --ids $resourceId --query "{location:location, sku:sku.name, skuCapacity:sku.capacity, zoneRedundant:properties.zoneRedundant, maximumNumberOfZones:properties.maximumNumberOfZones, hostingEnvironmentId:properties.hostingEnvironmentId}" -o json 2>$null
                 $planDetails = $planDetailsJson | ConvertFrom-Json
@@ -385,33 +436,129 @@ if ($eligibleForConversion -gt 0) {
                     }
                 }
                 
-                # Check if eligible for conversion
-                if ($regionSupportsZones -and $skuSupportsZones -and $maximumNumberOfZones -gt 1 -and 
-                    (-not $isIsolatedV2 -or $aseZoneRedundant -eq $true) -and $zoneRedundant -eq $false) {
-                    
-                    # Determine capacity to use
-                    $targetCapacity = if ($skuCapacity -lt 2) { 2 } else { $skuCapacity }
-                    
-                    Write-Host "Converting: $($parsed.PlanName) (current capacity: $skuCapacity → target capacity: $targetCapacity)" -ForegroundColor Yellow
-                    
-                    try {
-                        # Execute the conversion command
-                        $result = az appservice plan update --name $parsed.PlanName --resource-group $parsed.ResourceGroup --set zoneRedundant=true sku.capacity=$targetCapacity 2>&1
-                        
-                        if ($LASTEXITCODE -eq 0) {
-                            Write-Host "✓ Successfully converted $($parsed.PlanName) to zone redundant" -ForegroundColor Green
-                        } else {
-                            Write-Host "✗ Failed to convert $($parsed.PlanName): $result" -ForegroundColor Red
+                # Check if plan needs processing
+                if ($regionSupportsZones -and $zoneRedundant -eq $false) {
+                    if ($skuSupportsZones -and $maximumNumberOfZones -gt 1 -and 
+                        (-not $isIsolatedV2 -or $aseZoneRedundant -eq $true)) {
+                        # Plan is ready for zone redundancy conversion
+                        $targetCapacity = if ($skuCapacity -lt 2) { 2 } else { $skuCapacity }
+                        $conversionPlans += @{
+                            ResourceId = $resourceId
+                            PlanName = $parsed.PlanName
+                            ResourceGroup = $parsed.ResourceGroup
+                            CurrentSku = $sku
+                            TargetSku = $sku
+                            CurrentCapacity = $skuCapacity
+                            TargetCapacity = $targetCapacity
+                            NeedsSkuUpgrade = $false
                         }
                     }
-                    catch {
-                        Write-Host "✗ Error converting $($parsed.PlanName): $($_.Exception.Message)" -ForegroundColor Red
+                    elseif ($maximumNumberOfZones -gt 1 -and (-not $skuSupportsZones)) {
+                        # Plan needs SKU upgrade first - collect user decision
+                        $recommendedSku = Get-RecommendedSkuUpgrade -CurrentSku $sku
+                        
+                        Write-Host ""
+                        Write-Host "Plan '$($parsed.PlanName)' has unsupported SKU: $sku" -ForegroundColor Yellow
+                        Write-Host "Recommended upgrade SKU: $recommendedSku" -ForegroundColor Cyan
+                        
+                        # Allow user to customize the SKU
+                        $userSku = Read-Host "Enter SKU to upgrade to (press Enter for default: $recommendedSku)"
+                        if ([string]::IsNullOrWhiteSpace($userSku)) {
+                            $targetSku = $recommendedSku
+                        } else {
+                            $targetSku = $userSku.Trim()
+                        }
+                        
+                        # Confirm the upgrade
+                        Write-Host "Plan: $($parsed.PlanName)" -ForegroundColor White
+                        Write-Host "Current SKU: $sku → Target SKU: $targetSku" -ForegroundColor White
+                        $confirmUpgrade = Read-Host "Confirm SKU upgrade for this plan? (y/N)"
+                        
+                        if ($confirmUpgrade -eq 'y' -or $confirmUpgrade -eq 'Y' -or $confirmUpgrade -eq 'yes' -or $confirmUpgrade -eq 'YES') {
+                            $targetCapacity = if ($skuCapacity -lt 2) { 2 } else { $skuCapacity }
+                            $conversionPlans += @{
+                                ResourceId = $resourceId
+                                PlanName = $parsed.PlanName
+                                ResourceGroup = $parsed.ResourceGroup
+                                CurrentSku = $sku
+                                TargetSku = $targetSku
+                                CurrentCapacity = $skuCapacity
+                                TargetCapacity = $targetCapacity
+                                NeedsSkuUpgrade = $true
+                            }
+                        } else {
+                            Write-Host "Skipping $($parsed.PlanName) - upgrade declined by user" -ForegroundColor Yellow
+                        }
                     }
                 }
             }
             catch {
                 Write-Host "✗ Error processing $($parsed.PlanName): Unable to retrieve plan details" -ForegroundColor Red
             }
+        }
+        
+        # Display conversion summary
+        if ($conversionPlans.Count -gt 0) {
+            Write-Host ""
+            Write-Host "=== Conversion Summary ===" -ForegroundColor Blue
+            Write-Host "The following $($conversionPlans.Count) plan(s) will be processed:" -ForegroundColor White
+            
+            foreach ($plan in $conversionPlans) {
+                if ($plan.NeedsSkuUpgrade) {
+                    Write-Host "• $($plan.PlanName): Upgrade $($plan.CurrentSku) → $($plan.TargetSku), then enable ZR (capacity: $($plan.CurrentCapacity) → $($plan.TargetCapacity))" -ForegroundColor Yellow
+                } else {
+                    Write-Host "• $($plan.PlanName): Enable ZR (capacity: $($plan.CurrentCapacity) → $($plan.TargetCapacity))" -ForegroundColor Cyan
+                }
+            }
+            
+            Write-Host ""
+            $finalConfirm = Read-Host "Proceed with all conversions? (y/N)"
+            
+            if ($finalConfirm -eq 'y' -or $finalConfirm -eq 'Y' -or $finalConfirm -eq 'yes' -or $finalConfirm -eq 'YES') {
+                Write-Host ""
+                Write-Host "=== Executing Conversions ===" -ForegroundColor Blue
+                
+                # Second pass: Execute all planned conversions
+                foreach ($plan in $conversionPlans) {
+                    if ($plan.NeedsSkuUpgrade) {
+                        Write-Host "Upgrading and converting: $($plan.PlanName) (SKU: $($plan.CurrentSku) → $($plan.TargetSku), capacity: $($plan.CurrentCapacity) → $($plan.TargetCapacity))" -ForegroundColor Yellow
+                        
+                        try {
+                            # Execute the upgrade and conversion command
+                            $result = az appservice plan update --name $plan.PlanName --resource-group $plan.ResourceGroup --set sku.name=$($plan.TargetSku) sku.capacity=$($plan.TargetCapacity) zoneRedundant=true 2>&1
+                            
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Host "✓ Successfully upgraded and converted $($plan.PlanName) to zone redundant" -ForegroundColor Green
+                            } else {
+                                Write-Host "✗ Failed to upgrade and convert $($plan.PlanName): $result" -ForegroundColor Red
+                            }
+                        }
+                        catch {
+                            Write-Host "✗ Error upgrading and converting $($plan.PlanName): $($_.Exception.Message)" -ForegroundColor Red
+                        }
+                    } else {
+                        Write-Host "Converting: $($plan.PlanName) (current capacity: $($plan.CurrentCapacity) → target capacity: $($plan.TargetCapacity))" -ForegroundColor Yellow
+                        
+                        try {
+                            # Execute the conversion command
+                            $result = az appservice plan update --name $plan.PlanName --resource-group $plan.ResourceGroup --set zoneRedundant=true sku.capacity=$($plan.TargetCapacity) 2>&1
+                            
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Host "✓ Successfully converted $($plan.PlanName) to zone redundant" -ForegroundColor Green
+                            } else {
+                                Write-Host "✗ Failed to convert $($plan.PlanName): $result" -ForegroundColor Red
+                            }
+                        }
+                        catch {
+                            Write-Host "✗ Error converting $($plan.PlanName): $($_.Exception.Message)" -ForegroundColor Red
+                        }
+                    }
+                }
+            } else {
+                Write-Host "Conversion cancelled by user." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "No plans selected for conversion." -ForegroundColor Yellow
         }
         
         Write-Host ""
